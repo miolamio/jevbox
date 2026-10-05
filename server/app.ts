@@ -1494,6 +1494,7 @@ export async function createApp(options: {
           res.set("Retry-After", String(error.retryAfter ?? 60));
         return res.status(error.status).json({ error: error.message });
       }
+      console.error("Unhandled request error", _req.method, _req.path, error);
       res
         .status(500)
         .json({ error: "The request could not be completed. Please retry." });

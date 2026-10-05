@@ -20,7 +20,23 @@ export async function jsonRequest(
     redirect: "error",
   });
   if (!response.ok) {
-    await response.body?.cancel().catch(() => {});
+    const reader = response.body?.getReader();
+    const detail = reader
+      ? await reader
+          .read()
+          .then(({ value }) =>
+            Buffer.from(value ?? []).toString("utf8", 0, 500),
+          )
+          .catch(() => "")
+      : "";
+    await reader?.cancel().catch(() => {});
+    const { host, pathname } = new URL(url);
+    console.error(
+      "Provider request failed",
+      response.status,
+      `${host}${pathname}`,
+      detail,
+    );
     const message = `Provider request failed (${response.status}). Check your key and account limits.`;
     if (response.status < 500 && response.status !== 429)
       throw new ProviderResponseError(message);
