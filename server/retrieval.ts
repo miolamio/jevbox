@@ -1,6 +1,11 @@
 import { createLimiter } from "./async";
 import { createTraversal, type RouteNode } from "./beam-search";
-import { createJev, retrievalLimits } from "./jev";
+import {
+  createJev,
+  estimateTokens,
+  retrievalLimits,
+  truncateTokens,
+} from "./jev";
 import {
   HttpError,
   type Actor,
@@ -46,6 +51,7 @@ type Value = {
   sources: Omit<RetrievedSource, "score" | "routeScore">[];
 };
 const evidenceSlot = createLimiter(retrievalLimits.evidenceConcurrency);
+const evidenceOverhead = 384;
 
 export async function retrieveDocuments(
   store: Store,
@@ -178,10 +184,8 @@ export async function retrieveDocuments(
       retrievalLimits.menuSize,
       Math.ceil(nodes.length / retrievalLimits.menuSize),
     );
-    const groupBudget = Math.floor(
-      (retrievalLimits.routingCharacters - 4096) /
-        Math.ceil(nodes.length / size),
-    );
+    const groupBudget =
+      (retrievalLimits.routingTokens - 1024) / Math.ceil(nodes.length / size);
     for (let start = 0; start < nodes.length; start += size) {
       const children = bounded(
         nodes.slice(start, start + size),
@@ -196,11 +200,9 @@ export async function retrieveDocuments(
           ).filter(
             (description): description is string => description !== undefined,
           );
-          const length = Math.floor(
-            groupBudget / Math.max(1, descriptions.length),
-          );
+          const length = groupBudget / Math.max(1, descriptions.length);
           return descriptions.length
-            ? `Source group: ${descriptions.map((description) => description.slice(0, length)).join("\n")}`
+            ? `Source group: ${descriptions.map((description) => truncateTokens(description, length)).join("\n")}`
             : undefined;
         },
       });
@@ -345,26 +347,22 @@ export async function retrieveDocuments(
         ).filter((outline): outline is string => outline !== undefined);
         const siblings = (byParent.get(resource.parent_id) ?? []).length;
         const budget = Math.min(
-          16000,
-          Math.floor(
-            (retrievalLimits.routingCharacters - 8192) /
-              Math.max(1, Math.min(retrievalLimits.menuSize, siblings)),
-          ),
+          4000,
+          (retrievalLimits.routingTokens - 2048) /
+            Math.max(1, Math.min(retrievalLimits.menuSize, siblings)),
         );
-        const prefix =
-          `${resource.name}\n${resource.description.slice(0, 600)}\nContained sources:\n`.slice(
-            0,
-            budget,
-          );
+        const prefix = truncateTokens(
+          `${resource.name}\n${resource.description.slice(0, 600)}\nContained sources:\n`,
+          budget,
+        );
         const size = Math.max(
           0,
-          Math.floor(
-            (budget - prefix.length - outlines.length) /
-              Math.max(1, outlines.length),
-          ),
+          (budget - estimateTokens(prefix) - outlines.length / 4) /
+            Math.max(1, outlines.length),
         );
         return (
-          prefix + outlines.map((outline) => outline.slice(0, size)).join("\n")
+          prefix +
+          outlines.map((outline) => truncateTokens(outline, size)).join("\n")
         );
       },
       children: bounded(children, `category:${resource.id}`),
@@ -438,6 +436,10 @@ export async function retrieveDocuments(
     options?.recoverRoutes ?? true,
   );
   const jev = createJev(key, fetcher, signal);
+  const evidenceBudget =
+    retrievalLimits.routingTokens - estimateTokens(JSON.stringify(query)) - 64;
+  const evidence = (source: Omit<RetrievedSource, "score">) =>
+    `Source: ${source.name}\nSection: ${source.title}\nPages: ${source.page}–${source.endPage}\n\n${source.content}`;
   const results: RetrievedSource[] = [];
   const trace: RetrievalStep[] = [];
   const candidates: Omit<RetrievedSource, "score">[] = [];
@@ -487,6 +489,7 @@ export async function retrieveDocuments(
         candidates.push({ ...source, routeScore: route.score });
     }
     const batch: typeof candidates = [];
+    let batchTokens = 0;
     while (
       candidates.length &&
       batch.length <
@@ -500,7 +503,12 @@ export async function retrieveDocuments(
       candidates.sort(
         (a, b) => rounds(a) - rounds(b) || b.routeScore - a.routeScore,
       );
+      const size =
+        estimateTokens(JSON.stringify(evidence(candidates[0]))) +
+        evidenceOverhead;
+      if (batch.length && batchTokens + size > evidenceBudget) break;
       const source = candidates.shift()!;
+      batchTokens += size;
       batch.push(source);
       passageCounts.set(
         source.documentId,
@@ -522,13 +530,7 @@ export async function retrieveDocuments(
           routeScore: source.routeScore,
         })),
       );
-      const scores = await jev.scorePassages(
-        query,
-        approved.map(
-          (source) =>
-            `Source: ${source.name}\nSection: ${source.title}\nPages: ${source.page}–${source.endPage}\n\n${source.content}`,
-        ),
-      );
+      const scores = await jev.scorePassages(query, approved.map(evidence));
       signal?.throwIfAborted();
       return readable(
         approved.flatMap((source, index) =>
@@ -567,13 +569,15 @@ export async function retrieveDocuments(
           if (!approved.length) return 0;
           return jev.score(
             query,
-            approved
-              .map(
-                (source) =>
-                  `Source: ${source.name}\nSection: ${source.title}\nPages: ${source.page}–${source.endPage}\n${source.content}`,
-              )
-              .join("\n\n")
-              .slice(0, retrievalLimits.contextCharacters),
+            truncateTokens(
+              approved
+                .map(
+                  (source) =>
+                    `Source: ${source.name}\nSection: ${source.title}\nPages: ${source.page}–${source.endPage}\n${source.content}`,
+                )
+                .join("\n\n"),
+              retrievalLimits.coverageTokens,
+            ),
           );
         }, signal);
         if (score >= retrievalLimits.sufficientScore) break;

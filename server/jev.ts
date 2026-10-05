@@ -4,12 +4,13 @@ import { jsonRequest, ProviderResponseError } from "./provider-http";
 
 export const retrievalLimits = {
   menuSize: 64,
-  routingCharacters: 96000,
+  routingTokens: 24000,
   beamWidth: 4,
   expansions: 96,
   passages: 96,
   results: 12,
   contextCharacters: 24000,
+  coverageTokens: 6000,
   minimumUsefulResults: 3,
   minimumScore: 1.5,
   sufficientScore: 2.75,
@@ -20,6 +21,27 @@ export const retrievalLimits = {
 } as const;
 
 export const filingMenuSize = 16;
+
+export function estimateTokens(text: string) {
+  let tokens = 0;
+  for (let i = 0; i < text.length; i++)
+    tokens += text.charCodeAt(i) < 128 ? 0.25 : 1;
+  return tokens;
+}
+export function truncateTokens(text: string, tokens: number) {
+  let used = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const pair =
+      code >= 0xd800 &&
+      code < 0xdc00 &&
+      (text.charCodeAt(i + 1) & 0xfc00) === 0xdc00;
+    used += code < 128 ? 0.25 : pair ? 2 : 1;
+    if (used > tokens) return text.slice(0, i);
+    if (pair) i++;
+  }
+  return text;
+}
 
 const probability = z.number().finite().min(0).max(1);
 const choiceSchema = z.object({

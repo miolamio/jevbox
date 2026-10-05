@@ -1,4 +1,9 @@
-import { createJev, retrievalLimits } from "./jev";
+import {
+  createJev,
+  estimateTokens,
+  retrievalLimits,
+  truncateTokens,
+} from "./jev";
 
 export type RouteNode<T> = {
   id: string;
@@ -36,6 +41,30 @@ export function extendRoute<T>(
   };
 }
 
+const jsonTokens = (value: unknown) => estimateTokens(JSON.stringify(value));
+const menuOverhead = 256;
+const menuTokens = (choices: { id: string; text: string }[]) =>
+  jsonTokens(choices.map(({ id, text }) => ({ id, text }))) + menuOverhead;
+function clip(text: string, tokens: number) {
+  let clipped = truncateTokens(text, tokens);
+  for (let excess; (excess = jsonTokens(clipped) - 0.5 - tokens) > 0;)
+    clipped = truncateTokens(clipped, estimateTokens(clipped) - excess);
+  return clipped;
+}
+function fit<C extends { id: string; text: string }>(
+  choices: C[],
+  budget: number,
+) {
+  if (menuTokens(choices) <= budget) return choices;
+  const share =
+    (budget - menuTokens(choices.map((choice) => ({ ...choice, text: "" })))) /
+    choices.length;
+  return choices.map((choice) => ({
+    ...choice,
+    text: clip(choice.text, share),
+  }));
+}
+
 export function createTraversal<T>(
   roots: RouteNode<T>[],
   jev: Pick<ReturnType<typeof createJev>, "choose">,
@@ -63,6 +92,7 @@ export function createTraversal<T>(
   const expandedNodes = new Set<string>();
   const evidenceVisits = new Map<string, number>();
   let expansions = 0;
+  const budget = retrievalLimits.routingTokens - jsonTokens(query) - 64;
   const rank = (a: Route<T>, b: Route<T>) => {
     const rounds = (route: Route<T>) =>
       Math.floor(
@@ -132,7 +162,7 @@ export function createTraversal<T>(
         if (!prepared.length) break;
         const distributions = new Map<string, Record<string, number>>();
         let pending: typeof prepared = [];
-        let characters = 0;
+        let tokens = 0;
         const dispatch = async () => {
           const menus = [];
           for (const menu of pending) {
@@ -146,24 +176,21 @@ export function createTraversal<T>(
             ).flat();
             menu.choices = choices;
             if (choices.length > 1)
-              menus.push({ id: menu.route.node.id, choices });
+              menus.push({
+                id: menu.route.node.id,
+                choices: fit(choices, budget),
+              });
           }
           for (const [id, distribution] of await jev.choose(query, menus))
             distributions.set(id, distribution);
           pending = [];
-          characters = 0;
+          tokens = 0;
         };
         for (const menu of prepared) {
-          const size = JSON.stringify(
-            menu.choices.map(({ id, text }) => ({ id, text })),
-          ).length;
-          if (
-            pending.length &&
-            characters + size > retrievalLimits.routingCharacters
-          )
-            await dispatch();
+          const size = Math.min(menuTokens(menu.choices), budget);
+          if (pending.length && tokens + size > budget) await dispatch();
           pending.push(menu);
-          characters += size;
+          tokens += size;
         }
         if (pending.length) await dispatch();
         const expanded: Route<T>[] = [];

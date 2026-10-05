@@ -7,7 +7,7 @@ import {
   type RouteNode,
   type Route,
 } from "../server/beam-search";
-import { createJev, retrievalLimits } from "../server/jev";
+import { createJev, estimateTokens, retrievalLimits } from "../server/jev";
 import { createLimiter } from "../server/async";
 import { buildIndex, flatten, withLayoutSections } from "../server/indexing";
 import { createProviders } from "../server/providers";
@@ -519,7 +519,7 @@ test("wide category menus bound their authorized child outlines", async () => {
       if (body.questions.route_0?.criteria["category:folder-0"]) {
         rootChecked = true;
         assert.ok(
-          String(init?.body).length < retrievalLimits.routingCharacters,
+          estimateTokens(String(init?.body)) < retrievalLimits.routingTokens,
         );
       }
       return jevFetch(input, init);
@@ -1096,7 +1096,8 @@ test("large frontier requests stay bounded and recheck branches between requests
       requests.push(body);
       if (body.questions.route_0.criteria["a-0"]) revoked = true;
       assert.ok(
-        String(init?.body).length < retrievalLimits.routingCharacters + 3000,
+        estimateTokens(String(init?.body)) <
+          retrievalLimits.routingTokens + 750,
       );
       return choiceResponse(body);
     }),
@@ -1105,6 +1106,77 @@ test("large frontier requests stay bounded and recheck branches between requests
   await traversal.walk();
   assert.ok(requests.length >= 4);
   assert.equal(JSON.stringify(requests.slice(1)).includes('"b-0"'), false);
+});
+
+const loneSurrogate =
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+test("a single multibyte menu is clipped to the routing token budget on character boundaries", async () => {
+  const sizes: number[] = [];
+  const traversal = createTraversal(
+    [
+      {
+        id: "root",
+        describe: async () => "Корень",
+        children: Array.from({ length: retrievalLimits.menuSize }, (_, i) => ({
+          id: `раздел-${i}`,
+          children: [],
+          describe: async () => `Раздел ${i} 😀 `.repeat(120),
+        })),
+      },
+    ],
+    createJev("key", async (_url, init) => {
+      const body = String(init?.body);
+      sizes.push(estimateTokens(body));
+      const parsed = JSON.parse(body);
+      for (const question of Object.values<any>(parsed.questions))
+        for (const text of Object.values<string>(question.criteria))
+          assert.equal(loneSurrogate.test(text), false);
+      return choiceResponse(parsed);
+    }),
+    "Какие разделы описывают предмет? ".repeat(100),
+  );
+  await traversal.walk();
+  assert.ok(sizes.length > 0);
+  assert.ok(Math.max(...sizes) <= retrievalLimits.routingTokens, `${sizes}`);
+  assert.ok(Math.max(...sizes) > retrievalLimits.routingTokens * 0.8);
+});
+
+test("Cyrillic libraries keep every JEV request within the routing token budget", async () => {
+  const resources: Resource[] = [];
+  for (let i = 0; i < 8; i++) {
+    const folder = {
+      ...document(`папка-${i}`, ""),
+      kind: "folder" as const,
+      parsed: null,
+      description: "Описание папки ".repeat(40),
+    };
+    resources.push(folder);
+    resources.push(
+      document(
+        `источник-${i}`,
+        Array.from(
+          { length: 60 },
+          (_, j) =>
+            `# Раздел ${j}\n${`Сведения о предмете номер ${j} и связанных фактах. `.repeat(50)}`,
+        ).join("\n\n"),
+        folder.id,
+      ),
+    );
+  }
+  const { store } = storeFor(resources);
+  const sizes: number[] = [];
+  await retrieveDocuments(
+    store,
+    actor,
+    "Какие сведения о предмете подтверждены?",
+    "key",
+    async (input, init) => {
+      sizes.push(estimateTokens(String(init?.body)));
+      return jevFetch(input, init);
+    },
+  );
+  assert.ok(sizes.length > 1);
+  assert.ok(Math.max(...sizes) <= retrievalLimits.routingTokens, `${sizes}`);
 });
 
 test("large menus use one hierarchy of distributions rather than independently normalized batches", async () => {
